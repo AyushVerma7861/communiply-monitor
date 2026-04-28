@@ -135,17 +135,18 @@ def format_feed_item(item):
     author        = post.get("author_username", "unknown")
     tweet_text    = post.get("tweet_text", "")[:200]
     tweet_url     = post.get("tweet_url", "")
-    action_type   = reply.get("action_type", "like").title()   # "Like" or "Reply"
+    action_type   = reply.get("action_type", "like").lower()
     campaign_title = campaign.get("title", "")
     platform      = post.get("platform", "twitter")
 
-    emoji = "❤️" if action_type.lower() == "like" else "💬"
+    emoji = {"like": "❤️", "retweet": "🔁", "reply": "💬"}.get(action_type, "✅")
+    action_label = {"like": "Like", "retweet": "Repost", "reply": "Reply to"}.get(action_type, action_type.title())
 
     lines = [
         f"{emoji} <b>New Communiply Feed Task! (+30 pts)</b>",
         f"👤 @{author}",
         f"📝 {tweet_text}",
-        f"✅ Action: {action_type} this post",
+        f"✅ Action: {action_label} this post",
     ]
     if campaign_title:
         lines.append(f"📢 Campaign: {campaign_title[:80]}")
@@ -199,9 +200,9 @@ def main():
             # ── Communiply Feed ───────────────────────────────────────────────
             feed_items = fetch_feed_items()
             for item in feed_items:
-                item_id = item.get("reply", {}).get("id", "")
+                item_id = item.get("post", {}).get("id", "")  # dedupe by post, not reply
                 if item_id and item_id not in seen_feed:
-                    log.info(f"NEW feed item: {item_id}")
+                    log.info(f"NEW feed task (post): {item_id}")
                     send_telegram(format_feed_item(item))
                     seen_feed.add(item_id)
 
