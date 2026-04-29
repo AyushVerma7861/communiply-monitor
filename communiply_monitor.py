@@ -59,27 +59,58 @@ def send_telegram(text):
 
 # ── Auto-detect next-action hash ──────────────────────────────────────────────
 
+# Track consecutive hash failures for alerting
+_hash_fail_count = 0
+_hash_alert_sent = False
+
 def get_next_action_hash():
     """
-    Fetches the live /frame/feed page and extracts the current next-action hash.
-    Falls back to the hardcoded hash if detection fails.
+    Fetches the feed page, finds the JS chunk URL for the feed page component,
+    then searches that JS file for the createServerReference hash.
+    Falls back to hardcoded hash and alerts via Telegram after 3 consecutive failures.
     """
+    global _hash_fail_count, _hash_alert_sent
     try:
+        # Step 1: Get the feed page HTML to find the JS chunk filename
         r = requests.get(
             f"{BASE_URL}/frame/feed",
             headers={**HEADERS, "Accept": "text/html"},
             timeout=15
         )
-        # Hash looks like: "id":"40a7b53e..." in the page JS
-        match = re.search(r'"id"\s*:\s*"(40[a-f0-9]{38,42})"', r.text)
-        if match:
-            h = match.group(1)
-            log.info(f"Auto-detected hash: {h}")
-            return h
-        else:
-            log.warning("Hash not found in page, using fallback")
+        # Step 2: Find the feed page JS chunk URL
+        chunk_match = re.search(r'/_next/static/chunks/app/\(frame\)/frame/feed/page-([a-f0-9]+\.js)', r.text)
+        if chunk_match:
+            chunk_url = f"{BASE_URL}/_next/static/chunks/app/(frame)/frame/feed/page-{chunk_match.group(1)}"
+            js = requests.get(chunk_url, headers=HEADERS, timeout=15)
+            # Step 3: Find createServerReference hash in JS
+            hash_match = re.search(r'createServerReference\\(\\"(40[a-f0-9]{38,42})\\"', js.text)
+            if not hash_match:
+                # broader fallback pattern
+                hash_match = re.search(r'"(40[a-f0-9]{38,42})"', js.text)
+            if hash_match:
+                h = hash_match.group(1)
+                log.info(f"Auto-detected hash: {h}")
+                _hash_fail_count = 0
+                _hash_alert_sent = False
+                return h
+
+        log.warning("Hash not found in page, using fallback")
+        _hash_fail_count += 1
+
     except Exception as e:
         log.error(f"Hash detection error: {e}")
+        _hash_fail_count += 1
+
+    # Alert via Telegram after 3 consecutive failures
+    if _hash_fail_count >= 3 and not _hash_alert_sent:
+        global _hash_alert_sent
+        _hash_alert_sent = True
+        send_telegram(
+            "⚠️ <b>Communiply Monitor Warning</b>\n\n"
+            "The next-action hash has changed (ProductClank deployed an update).\n"
+            "Feed monitoring is currently using the fallback hash and may miss tasks.\n\n"
+            "Please export a new HAR file and send it to update the script."
+        )
 
     return FALLBACK_HASH
 
@@ -232,7 +263,9 @@ def main():
             # ── Communiply Feed ───────────────────────────────────────────────
             feed_items = fetch_feed_items(next_action_hash)
             for item in feed_items:
-                post_id = item.get("post", {}).get("id", "")  # dedupe by post
+                # dedupe by tweet_url — most unique key per task
+                post = item.get("post", {})
+                post_id = post.get("tweet_url") or post.get("id", "")
                 if post_id and post_id not in seen_feed:
                     log.info(f"NEW feed task: {post_id}")
                     send_telegram(format_feed_item(item))
