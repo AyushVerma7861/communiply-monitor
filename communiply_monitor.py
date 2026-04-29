@@ -1,29 +1,19 @@
 #!/usr/bin/env python3
 """
 ProductClank Communiply Monitor
-────────────────────────────────
-Monitors BOTH:
-  1. Communiply FEED  (like/repost/reply tasks) — via Next.js Server Action
-  2. Campaigns        (action tasks)             — via public API
-
-Sends Telegram alerts when anything new appears.
-Auto-detects the next-action hash on every run so it never breaks on deploys.
-
-Setup:
-  pip install requests
-  python communiply_monitor.py
+Checks every 5 minutes, alerts via Telegram on new feed tasks + campaigns.
 """
 
 import os, json, time, re, logging, requests
 from datetime import datetime
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN  = "8745180952:AAFSPC552Aqo8AEmIEnw1nrH3kuPXCe_9pA"
-TELEGRAM_CHAT_ID    = ["1364114058", "5561181442"]
-PC_USER_ID          = "61b9ad05-ab10-46c3-ae39-8d16931f5452"
-FALLBACK_HASH       = "40a7b53e562648f22187e1fad072f056fc9dac8158"  # used if auto-detect fails
-CHECK_INTERVAL_SEC  = 5 * 60   # 5 minutes
-STATE_FILE          = "seen_items.json"
+TELEGRAM_BOT_TOKEN = "8745180952:AAFSPC552Aqo8AEmIEnw1nrH3kuPXCe_9pA"
+TELEGRAM_CHAT_IDS  = ["1364114058", "5561181442"]
+PC_USER_ID         = "61b9ad05-ab10-46c3-ae39-8d16931f5452"
+FALLBACK_HASH      = "40a7b53e562648f22187e1fad072f056fc9dac8158"
+CHECK_INTERVAL     = 5 * 60
+STATE_FILE         = "seen_items.json"
 # ──────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
@@ -35,15 +25,14 @@ HEADERS = {
     "Referer": f"{BASE_URL}/frame/feed",
     "Origin": BASE_URL,
     "Accept": "*/*",
-    "sec-fetch-site": "same-origin",
-    "sec-fetch-mode": "cors",
 }
 
+# Track hash failures globally using a dict to avoid global keyword issues
+state = {"hash_fail_count": 0, "hash_alert_sent": False}
 
-# ── Telegram ──────────────────────────────────────────────────────────────────
 
 def send_telegram(text):
-    for chat_id in TELEGRAM_CHAT_ID:
+    for chat_id in TELEGRAM_CHAT_IDS:
         try:
             r = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -57,71 +46,57 @@ def send_telegram(text):
             log.error(f"Telegram error for {chat_id}: {e}")
 
 
-# ── Auto-detect next-action hash ──────────────────────────────────────────────
-
-# Track consecutive hash failures for alerting
-_hash_fail_count = 0
-_hash_alert_sent = False
-
 def get_next_action_hash():
     """
-    Fetches the feed page, finds the JS chunk URL for the feed page component,
-    then searches that JS file for the createServerReference hash.
-    Falls back to hardcoded hash and alerts via Telegram after 3 consecutive failures.
+    Finds the feed page JS chunk and extracts the createServerReference hash.
+    Alerts via Telegram after 3 consecutive failures.
     """
-    global _hash_fail_count, _hash_alert_sent
     try:
-        # Step 1: Get the feed page HTML to find the JS chunk filename
-        r = requests.get(
-            f"{BASE_URL}/frame/feed",
-            headers={**HEADERS, "Accept": "text/html"},
-            timeout=15
-        )
-        # Step 2: Find the feed page JS chunk URL
-        chunk_match = re.search(r'/_next/static/chunks/app/\(frame\)/frame/feed/page-([a-f0-9]+\.js)', r.text)
+        # Step 1: get feed page HTML to find JS chunk filename
+        r = requests.get(f"{BASE_URL}/frame/feed",
+                         headers={**HEADERS, "Accept": "text/html"}, timeout=15)
+
+        # Step 2: find the feed page JS chunk URL
+        chunk_match = re.search(
+            r'/_next/static/chunks/app/\(frame\)/frame/feed/page-([a-f0-9]+\.js)', r.text)
+
         if chunk_match:
             chunk_url = f"{BASE_URL}/_next/static/chunks/app/(frame)/frame/feed/page-{chunk_match.group(1)}"
             js = requests.get(chunk_url, headers=HEADERS, timeout=15)
-            # Step 3: Find createServerReference hash in JS
-            hash_match = re.search(r'createServerReference\\(\\"(40[a-f0-9]{38,42})\\"', js.text)
+
+            # Step 3: find hash inside createServerReference("40...")
+            hash_match = re.search(r'createServerReference\("(40[a-f0-9]{38,42})"', js.text)
             if not hash_match:
-                # broader fallback pattern
                 hash_match = re.search(r'"(40[a-f0-9]{38,42})"', js.text)
+
             if hash_match:
                 h = hash_match.group(1)
                 log.info(f"Auto-detected hash: {h}")
-                _hash_fail_count = 0
-                _hash_alert_sent = False
+                state["hash_fail_count"] = 0
+                state["hash_alert_sent"] = False
                 return h
 
         log.warning("Hash not found in page, using fallback")
-        _hash_fail_count += 1
+        state["hash_fail_count"] += 1
 
     except Exception as e:
         log.error(f"Hash detection error: {e}")
-        _hash_fail_count += 1
+        state["hash_fail_count"] += 1
 
-    # Alert via Telegram after 3 consecutive failures
-    if _hash_fail_count >= 3 and not _hash_alert_sent:
-        global _hash_alert_sent
-        _hash_alert_sent = True
+    # Alert after 3 consecutive failures
+    if state["hash_fail_count"] >= 3 and not state["hash_alert_sent"]:
+        state["hash_alert_sent"] = True
         send_telegram(
             "⚠️ <b>Communiply Monitor Warning</b>\n\n"
             "The next-action hash has changed (ProductClank deployed an update).\n"
-            "Feed monitoring is currently using the fallback hash and may miss tasks.\n\n"
+            "Feed tasks may be missed until the script is updated.\n\n"
             "Please export a new HAR file and send it to update the script."
         )
 
     return FALLBACK_HASH
 
 
-# ── Fetch Communiply Feed ─────────────────────────────────────────────────────
-
 def fetch_feed_items(next_action_hash):
-    """
-    POSTs to /frame/feed using your userId + next-action hash.
-    Returns list of {reply, post, campaign} dicts.
-    """
     try:
         r = requests.post(
             f"{BASE_URL}/frame/feed",
@@ -135,8 +110,6 @@ def fetch_feed_items(next_action_hash):
             timeout=20
         )
         r.raise_for_status()
-
-        # Response is Next.js streaming format — feed items are on the "1:[...]" line
         for line in r.text.splitlines():
             if line.startswith("1:"):
                 data = json.loads(line[2:])
@@ -145,11 +118,8 @@ def fetch_feed_items(next_action_hash):
                     return data
     except Exception as e:
         log.error(f"Feed fetch error: {e}")
-
     return []
 
-
-# ── Fetch Campaigns ───────────────────────────────────────────────────────────
 
 def fetch_campaigns():
     seen, results = set(), []
@@ -170,8 +140,6 @@ def fetch_campaigns():
     return results
 
 
-# ── State ─────────────────────────────────────────────────────────────────────
-
 def load_seen():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
@@ -185,23 +153,18 @@ def save_seen(feed_ids, campaign_ids):
         json.dump({"feed": list(feed_ids), "campaigns": list(campaign_ids)}, f)
 
 
-# ── Formatters ────────────────────────────────────────────────────────────────
-
 def format_feed_item(item):
     post           = item.get("post", {})
     reply          = item.get("reply", {})
     campaign       = item.get("campaign", {})
-
     author         = post.get("author_username", "unknown")
     tweet_text     = post.get("tweet_text", "")[:200]
     tweet_url      = post.get("tweet_url", "")
     action_type    = reply.get("action_type", "like").lower()
     campaign_title = campaign.get("title", "")
     platform       = post.get("platform", "twitter")
-
     emoji        = {"like": "❤️", "retweet": "🔁", "reply": "💬"}.get(action_type, "✅")
     action_label = {"like": "Like", "retweet": "Repost", "reply": "Reply to"}.get(action_type, action_type.title())
-
     lines = [
         f"{emoji} <b>New Communiply Feed Task! (+30 pts)</b>",
         f"👤 @{author}",
@@ -223,7 +186,6 @@ def format_campaign(c):
     action = c.get("action_cta", "")
     url    = c.get("action_url", "")
     end    = c.get("end_date", "")
-
     lines = [f"📢 <b>New Campaign Task!</b>", f"<b>{title}</b>"]
     if ctype:  lines.append(f"📋 {ctype}")
     if reward: lines.append(f"🎁 {reward}")
@@ -239,11 +201,8 @@ def format_campaign(c):
     return "\n".join(lines)
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
-
 def main():
     log.info("=== Communiply Monitor starting ===")
-
     send_telegram(
         "🤖 <b>Communiply Monitor is live!</b>\n"
         "Watching:\n"
@@ -257,13 +216,11 @@ def main():
 
     while True:
         try:
-            # Auto-detect hash on every run — survives ProductClank deploys
             next_action_hash = get_next_action_hash()
 
-            # ── Communiply Feed ───────────────────────────────────────────────
+            # Feed
             feed_items = fetch_feed_items(next_action_hash)
             for item in feed_items:
-                # dedupe by tweet_url — most unique key per task
                 post = item.get("post", {})
                 post_id = post.get("tweet_url") or post.get("id", "")
                 if post_id and post_id not in seen_feed:
@@ -271,7 +228,7 @@ def main():
                     send_telegram(format_feed_item(item))
                     seen_feed.add(post_id)
 
-            # ── Campaigns ─────────────────────────────────────────────────────
+            # Campaigns
             campaigns = fetch_campaigns()
             for c in campaigns:
                 if c["id"] not in seen_campaigns:
@@ -284,8 +241,8 @@ def main():
         except Exception as e:
             log.error(f"Loop error: {e}")
 
-        log.info(f"Sleeping {CHECK_INTERVAL_SEC // 60} min...\n")
-        time.sleep(CHECK_INTERVAL_SEC)
+        log.info(f"Sleeping {CHECK_INTERVAL // 60} min...\n")
+        time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
