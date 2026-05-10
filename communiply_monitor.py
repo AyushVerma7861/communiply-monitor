@@ -2,6 +2,10 @@
 """
 ProductClank Communiply Monitor
 Checks every 5 minutes, alerts via Telegram on new feed tasks + campaigns.
+
+Dedup strategy:
+  - State stores reply["id"] — so reappeared tasks (new reply ID after cooldown) get alerted again
+  - Within each fetch, dedup by tweet_url — so same tweet showing 4x doesn't spam you
 """
 
 import os, json, time, re, logging, requests
@@ -27,7 +31,6 @@ HEADERS = {
     "Accept": "*/*",
 }
 
-# Track hash failures globally using a dict to avoid global keyword issues
 state = {"hash_fail_count": 0, "hash_alert_sent": False}
 
 
@@ -47,43 +50,29 @@ def send_telegram(text):
 
 
 def get_next_action_hash():
-    """
-    Finds the feed page JS chunk and extracts the createServerReference hash.
-    Alerts via Telegram after 3 consecutive failures.
-    """
     try:
-        # Step 1: get feed page HTML to find JS chunk filename
         r = requests.get(f"{BASE_URL}/frame/feed",
                          headers={**HEADERS, "Accept": "text/html"}, timeout=15)
-
-        # Step 2: find the feed page JS chunk URL
         chunk_match = re.search(
             r'/_next/static/chunks/app/\(frame\)/frame/feed/page-([a-f0-9]+\.js)', r.text)
-
         if chunk_match:
             chunk_url = f"{BASE_URL}/_next/static/chunks/app/(frame)/frame/feed/page-{chunk_match.group(1)}"
             js = requests.get(chunk_url, headers=HEADERS, timeout=15)
-
-            # Step 3: find hash inside createServerReference("40...")
             hash_match = re.search(r'createServerReference\("(40[a-f0-9]{38,42})"', js.text)
             if not hash_match:
                 hash_match = re.search(r'"(40[a-f0-9]{38,42})"', js.text)
-
             if hash_match:
                 h = hash_match.group(1)
                 log.info(f"Auto-detected hash: {h}")
                 state["hash_fail_count"] = 0
                 state["hash_alert_sent"] = False
                 return h
-
         log.warning("Hash not found in page, using fallback")
         state["hash_fail_count"] += 1
-
     except Exception as e:
         log.error(f"Hash detection error: {e}")
         state["hash_fail_count"] += 1
 
-    # Alert after 3 consecutive failures
     if state["hash_fail_count"] >= 3 and not state["hash_alert_sent"]:
         state["hash_alert_sent"] = True
         send_telegram(
@@ -92,7 +81,6 @@ def get_next_action_hash():
             "Feed tasks may be missed until the script is updated.\n\n"
             "Please export a new HAR file and send it to update the script."
         )
-
     return FALLBACK_HASH
 
 
@@ -218,17 +206,32 @@ def main():
         try:
             next_action_hash = get_next_action_hash()
 
-            # Feed
+            # ── Communiply Feed ───────────────────────────────────────────────
             feed_items = fetch_feed_items(next_action_hash)
-            for item in feed_items:
-                post = item.get("post", {})
-                post_id = post.get("tweet_url") or post.get("id", "")
-                if post_id and post_id not in seen_feed:
-                    log.info(f"NEW feed task: {post_id}")
-                    send_telegram(format_feed_item(item))
-                    seen_feed.add(post_id)
 
-            # Campaigns
+            # Dedup within this batch by tweet_url (avoid 4x alerts for same tweet)
+            seen_urls_this_batch = set()
+
+            for item in feed_items:
+                reply_id  = item.get("reply", {}).get("id", "")
+                tweet_url = item.get("post", {}).get("tweet_url", "") or item.get("post", {}).get("id", "")
+
+                # Skip if already alerted this reply_id (persistent state)
+                if not reply_id or reply_id in seen_feed:
+                    continue
+
+                # Skip if same tweet already alerted in THIS batch
+                if tweet_url and tweet_url in seen_urls_this_batch:
+                    seen_feed.add(reply_id)  # mark as seen silently
+                    continue
+
+                log.info(f"NEW feed task: {reply_id}")
+                send_telegram(format_feed_item(item))
+                seen_feed.add(reply_id)
+                if tweet_url:
+                    seen_urls_this_batch.add(tweet_url)
+
+            # ── Campaigns ─────────────────────────────────────────────────────
             campaigns = fetch_campaigns()
             for c in campaigns:
                 if c["id"] not in seen_campaigns:
