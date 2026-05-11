@@ -13,7 +13,8 @@ from datetime import datetime
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = "8745180952:AAFSPC552Aqo8AEmIEnw1nrH3kuPXCe_9pA"
-TELEGRAM_CHAT_IDS  = ["1364114058", "5561181442"]
+# Chat IDs — RAVENxSPARK, Vasu Bhai, Aman Bhai, Rahul Bhai
+TELEGRAM_CHAT_IDS  = ["1364114058", "5561181442", "961643873", "2027508985"]
 PC_USER_ID         = "61b9ad05-ab10-46c3-ae39-8d16931f5452"
 FALLBACK_HASH      = "40a7b53e562648f22187e1fad072f056fc9dac8158"
 CHECK_INTERVAL     = 5 * 60
