@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """
 ProductClank Communiply Monitor
-Checks every 5 minutes, alerts via Telegram on new feed tasks + campaigns.
-
-Dedup strategy:
-  - State stores reply["id"] — so reappeared tasks (new reply ID after cooldown) get alerted again
-  - Within each fetch, dedup by tweet_url — so same tweet showing 4x doesn't spam you
+Checks every 1 minute, alerts via Telegram on new feed tasks + campaigns.
 """
 
 import os, json, time, re, logging, requests
@@ -13,11 +9,11 @@ from datetime import datetime
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = "8745180952:AAFSPC552Aqo8AEmIEnw1nrH3kuPXCe_9pA"
-# Chat IDs — RAVENxSPARK, Vasu Bhai, Aman Bhai, Rahul Bhai
 TELEGRAM_CHAT_IDS  = ["1364114058", "5561181442", "961643873", "2027508985"]
+# RAVENxSPARK, Vasu Bhai, Aman Bhai, Rahul Bhai
 PC_USER_ID         = "61b9ad05-ab10-46c3-ae39-8d16931f5452"
 FALLBACK_HASH      = "40a7b53e562648f22187e1fad072f056fc9dac8158"
-CHECK_INTERVAL     = 1 * 60  # 1 minute
+CHECK_INTERVAL     = 1 * 60
 STATE_FILE         = "seen_items.json"
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -78,9 +74,8 @@ def get_next_action_hash():
         state["hash_alert_sent"] = True
         send_telegram(
             "⚠️ <b>Communiply Monitor Warning</b>\n\n"
-            "The next-action hash has changed (ProductClank deployed an update).\n"
-            "Feed tasks may be missed until the script is updated.\n\n"
-            "Please export a new HAR file and send it to update the script."
+            "Hash auto-detect failed 3 times. Using fallback.\n"
+            "Please export a new HAR file if alerts stop working."
         )
     return FALLBACK_HASH
 
@@ -99,14 +94,45 @@ def fetch_feed_items(next_action_hash):
             timeout=20
         )
         r.raise_for_status()
-        for line in r.text.splitlines():
-            if line.startswith("1:"):
-                data = json.loads(line[2:])
-                if isinstance(data, list):
-                    log.info(f"Feed items fetched: {len(data)}")
-                    return data
+        log.info(f"Feed response length: {len(r.text)}")
+
+        # Search for 1:[...] anywhere in the response (may be embedded mid-text)
+        match = re.search(r'1:(\[)', r.text)
+        if not match:
+            log.warning("1:[ not found in feed response")
+            return []
+
+        # Extract from the position of 1:[ to end, then parse
+        json_start = match.start() + 2  # skip "1:"
+        json_str = r.text[json_start:]
+
+        # Try full parse first
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError:
+            # Trim to last ] and retry
+            end = json_str.rfind(']')
+            if end == -1:
+                log.error("Could not find end of JSON array in feed response")
+                return []
+            try:
+                data = json.loads(json_str[:end+1])
+            except json.JSONDecodeError as ex:
+                log.error(f"Feed JSON parse error: {ex}")
+                log.error(f"JSON sample: {json_str[:200]}")
+                return []
+
+        if isinstance(data, list):
+            log.info(f"Feed items fetched: {len(data)}")
+            return data
+
+        log.warning(f"Feed data not a list: {type(data)}")
+        return []
+
+    except requests.RequestException as e:
+        log.error(f"Feed request error: {e}")
     except Exception as e:
-        log.error(f"Feed fetch error: {e}")
+        log.error(f"Feed fetch unexpected error: {e}")
     return []
 
 
@@ -197,7 +223,7 @@ def main():
         "Watching:\n"
         "❤️ Communiply Feed (like/repost/reply tasks)\n"
         "📢 Campaigns (action tasks)\n\n"
-        "Checking every 5 minutes 🔔"
+        "Checking every 1 minute 🔔"
     )
 
     seen_feed, seen_campaigns = load_seen()
@@ -209,21 +235,17 @@ def main():
 
             # ── Communiply Feed ───────────────────────────────────────────────
             feed_items = fetch_feed_items(next_action_hash)
-
-            # Dedup within this batch by tweet_url (avoid 4x alerts for same tweet)
             seen_urls_this_batch = set()
 
             for item in feed_items:
                 reply_id  = item.get("reply", {}).get("id", "")
                 tweet_url = item.get("post", {}).get("tweet_url", "") or item.get("post", {}).get("id", "")
 
-                # Skip if already alerted this reply_id (persistent state)
                 if not reply_id or reply_id in seen_feed:
                     continue
 
-                # Skip if same tweet already alerted in THIS batch
                 if tweet_url and tweet_url in seen_urls_this_batch:
-                    seen_feed.add(reply_id)  # mark as seen silently
+                    seen_feed.add(reply_id)
                     continue
 
                 log.info(f"NEW feed task: {reply_id}")
@@ -245,7 +267,7 @@ def main():
         except Exception as e:
             log.error(f"Loop error: {e}")
 
-        log.info(f"Sleeping {CHECK_INTERVAL // 60} min...\n")
+        log.info(f"Sleeping {CHECK_INTERVAL} sec...\n")
         time.sleep(CHECK_INTERVAL)
 
 
