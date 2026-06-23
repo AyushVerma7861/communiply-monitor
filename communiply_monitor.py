@@ -12,7 +12,7 @@ TELEGRAM_BOT_TOKEN = "8745180952:AAFSPC552Aqo8AEmIEnw1nrH3kuPXCe_9pA"
 TELEGRAM_CHAT_IDS  = ["1364114058", "5561181442", "961643873", "2027508985"]
 # RAVENxSPARK, Vasu Bhai, Aman Bhai, Rahul Bhai
 PC_USER_ID         = "13f58f1f-ef9e-4a9e-93d8-6222e362739f"
-FALLBACK_HASH      = "40a7b53e562648f22187e1fad072f056fc9dac8158"
+FALLBACK_HASH      = "40daa03a714ea234a127d03cf72a9651981175a966"
 CHECK_INTERVAL     = 1 * 60
 STATE_FILE         = "seen_items.json"
 # ──────────────────────────────────────────────────────────────────────────────
