@@ -7,7 +7,7 @@ Checks every 1 minute, alerts via Telegram on new feed tasks + campaigns.
 import os, json, time, re, logging, requests
 from datetime import datetime
 
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
+# CONFIG
 TELEGRAM_BOT_TOKEN = "8745180952:AAFSPC552Aqo8AEmIEnw1nrH3kuPXCe_9pA"
 TELEGRAM_CHAT_IDS  = ["1364114058", "5561181442", "961643873", "2027508985"]
 # RAVENxSPARK, Vasu Bhai, Aman Bhai, Rahul Bhai
@@ -15,7 +15,6 @@ PC_USER_ID         = "13f58f1f-ef9e-4a9e-93d8-6222e362739f"
 FALLBACK_HASH      = "40daa03a714ea234a127d03cf72a9651981175a966"
 CHECK_INTERVAL     = 1 * 60
 STATE_FILE         = "seen_items.json"
-# ──────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
@@ -41,41 +40,71 @@ def send_telegram(text):
                 timeout=10
             )
             r.raise_for_status()
-            log.info(f"Telegram sent to {chat_id} ✓")
+            log.info(f"Telegram sent to {chat_id} OK")
         except Exception as e:
             log.error(f"Telegram error for {chat_id}: {e}")
 
 
+def verify_hash(h):
+    """Returns True if this hash gives a response > 200 bytes."""
+    try:
+        test = requests.post(
+            f"{BASE_URL}/frame/feed",
+            headers={
+                **HEADERS,
+                "Accept": "text/x-component",
+                "Content-Type": "text/plain;charset=UTF-8",
+                "next-action": h,
+            },
+            data=json.dumps([{"offset": 0, "limit": 1, "userId": PC_USER_ID}]),
+            timeout=15
+        )
+        return len(test.text) > 200
+    except Exception:
+        return False
+
+
 def get_next_action_hash():
+    # Step 1: verify FALLBACK_HASH still works
+    if verify_hash(FALLBACK_HASH):
+        log.info(f"Using verified fallback hash: {FALLBACK_HASH}")
+        state["hash_fail_count"] = 0
+        state["hash_alert_sent"] = False
+        return FALLBACK_HASH
+
+    log.warning("Fallback hash not working, trying auto-detect")
+
+    # Step 2: auto-detect from JS chunk
     try:
         r = requests.get(f"{BASE_URL}/frame/feed",
                          headers={**HEADERS, "Accept": "text/html"}, timeout=15)
         chunk_match = re.search(
-            r'/_next/static/chunks/app/\(frame\)/frame/feed/page-([a-f0-9]+\.js)', r.text)
+            r"/_next/static/chunks/app/[(]frame[)]/frame/feed/page-([a-f0-9]+[.]js)", r.text)
         if chunk_match:
             chunk_url = f"{BASE_URL}/_next/static/chunks/app/(frame)/frame/feed/page-{chunk_match.group(1)}"
             js = requests.get(chunk_url, headers=HEADERS, timeout=15)
-            hash_match = re.search(r'createServerReference\("(40[a-f0-9]{38,42})"', js.text)
-            if not hash_match:
-                hash_match = re.search(r'"(40[a-f0-9]{38,42})"', js.text)
+            hash_match = re.search(r'createServerReference[(]["](40[a-f0-9]{38,42})["]', js.text)
             if hash_match:
                 h = hash_match.group(1)
-                log.info(f"Auto-detected hash: {h}")
-                state["hash_fail_count"] = 0
-                state["hash_alert_sent"] = False
-                return h
-        log.warning("Hash not found in page, using fallback")
+                if verify_hash(h):
+                    log.info(f"Auto-detected working hash: {h}")
+                    state["hash_fail_count"] = 0
+                    state["hash_alert_sent"] = False
+                    return h
+                else:
+                    log.warning(f"Auto-detected hash {h} also not working")
+        log.warning("Auto-detect failed")
         state["hash_fail_count"] += 1
     except Exception as e:
-        log.error(f"Hash detection error: {e}")
+        log.error(f"Hash auto-detect error: {e}")
         state["hash_fail_count"] += 1
 
     if state["hash_fail_count"] >= 3 and not state["hash_alert_sent"]:
         state["hash_alert_sent"] = True
         send_telegram(
-            "⚠️ <b>Communiply Monitor Warning</b>\n\n"
-            "Hash auto-detect failed 3 times. Using fallback.\n"
-            "Please export a new HAR file if alerts stop working."
+            "WARNING: Communiply Monitor\n\n"
+            "Both hash methods failed 3 times.\n"
+            "Please export a new HAR file and send it to update the script."
         )
     return FALLBACK_HASH
 
@@ -96,37 +125,29 @@ def fetch_feed_items(next_action_hash):
         r.raise_for_status()
         log.info(f"Feed response length: {len(r.text)}")
 
-        # Search for 1:[...] anywhere in the response (may be embedded mid-text)
         match = re.search(r'1:(\[)', r.text)
         if not match:
             log.warning("1:[ not found in feed response")
             return []
 
-        # Extract from the position of 1:[ to end, then parse
-        json_start = match.start() + 2  # skip "1:"
-        json_str = r.text[json_start:]
-
-        # Try full parse first
+        json_str = r.text[match.start() + 2:]
         try:
             data = json.loads(json_str)
         except json.JSONDecodeError:
-            # Trim to last ] and retry
             end = json_str.rfind(']')
             if end == -1:
-                log.error("Could not find end of JSON array in feed response")
+                log.error("Could not find end of JSON array")
                 return []
             try:
-                data = json.loads(json_str[:end+1])
+                data = json.loads(json_str[:end + 1])
             except json.JSONDecodeError as ex:
                 log.error(f"Feed JSON parse error: {ex}")
-                log.error(f"JSON sample: {json_str[:200]}")
                 return []
 
         if isinstance(data, list):
             log.info(f"Feed items fetched: {len(data)}")
             return data
 
-        log.warning(f"Feed data not a list: {type(data)}")
         return []
 
     except requests.RequestException as e:
@@ -201,7 +222,7 @@ def format_campaign(c):
     action = c.get("action_cta", "")
     url    = c.get("action_url", "")
     end    = c.get("end_date", "")
-    lines = [f"📢 <b>New Campaign Task!</b>", f"<b>{title}</b>"]
+    lines  = [f"📢 <b>New Campaign Task!</b>", f"<b>{title}</b>"]
     if ctype:  lines.append(f"📋 {ctype}")
     if reward: lines.append(f"🎁 {reward}")
     if end:
@@ -233,7 +254,6 @@ def main():
         try:
             next_action_hash = get_next_action_hash()
 
-            # ── Communiply Feed ───────────────────────────────────────────────
             feed_items = fetch_feed_items(next_action_hash)
             seen_urls_this_batch = set()
 
@@ -254,7 +274,6 @@ def main():
                 if tweet_url:
                     seen_urls_this_batch.add(tweet_url)
 
-            # ── Campaigns ─────────────────────────────────────────────────────
             campaigns = fetch_campaigns()
             for c in campaigns:
                 if c["id"] not in seen_campaigns:
@@ -267,10 +286,9 @@ def main():
         except Exception as e:
             log.error(f"Loop error: {e}")
 
-        log.info(f"Sleeping {CHECK_INTERVAL} sec...\n")
+        log.info(f"Sleeping {CHECK_INTERVAL} sec...")
         time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
     main()
-    
